@@ -1,0 +1,11 @@
+{$CVC_HOST} {
+  reverse_proxy cvc:8080 {
+    flush_interval -1
+    transport http {
+      response_header_timeout 5m
+    }
+  }
+  request_body {
+    max_size 10MB
+  }
+}

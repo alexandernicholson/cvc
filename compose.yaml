@@ -1,0 +1,28 @@
+services:
+  cvc:
+    build: .
+    restart: unless-stopped
+    environment:
+      CVC_BIND: 0.0.0.0:8080
+      CVC_TRUSTED_PROXY: "true"
+      CVC_PUBLIC_URL: https://${CVC_HOST}
+      CVC_DATABASE_URL: sqlite:///data/cvc.db?mode=rwc
+      CVC_MASTER_KEY: ${CVC_MASTER_KEY:?required}
+      CVC_MODELS: ${CVC_MODELS:?required}
+      CVC_DEFAULT_MODEL: claude-codex-default
+    volumes: [cvc-data:/data]
+    healthcheck:
+      test: [CMD, cvc, --version]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    environment: {CVC_HOST: "${CVC_HOST:?required}"}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [cvc]
+volumes: {cvc-data: {}, caddy-data: {}}

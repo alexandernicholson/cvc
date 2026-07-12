@@ -1,0 +1,8 @@
+cvc
+
+This product includes behavior derived from OpenAI Codex:
+Copyright OpenAI and contributors
+https://github.com/openai/codex
+Licensed under the Apache License, Version 2.0.
+
+No OpenAI source code is copied into the distributed binary. Device OAuth and ChatGPT Codex transport behavior follows the upstream implementation and protocol.

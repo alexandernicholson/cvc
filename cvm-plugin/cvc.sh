@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Configure Claude Code to use a cvc Codex gateway through a cvp profile.
+
+_cvc_die() { printf 'error: %s\n' "$*" >&2; return 1; }
+_cvc_ok() { printf '✓ %s\n' "$*"; }
+_cvc_info() { printf '→ %s\n' "$*"; }
+
+_cvc_help() {
+  cat <<'EOF'
+cvm cvc — configure Claude Code for a cvc Codex gateway
+
+USAGE
+  cvm cvc configure [options]  Create/update a secure cvp profile
+  cvm cvc show [profile]       Show the profile with secrets masked
+  cvm cvc status [profile]     Check gateway health, readiness, and models
+  cvm cvc test [profile]       Run a real Claude Code inference
+  cvm cvc help                 Show this help
+
+CONFIGURE OPTIONS
+  --profile NAME               Profile name (default: codex)
+  --url URL                    Gateway URL (default: http://127.0.0.1:18082)
+  --token TOKEN                Gateway bearer token; prefer CVC_GATEWAY_KEY
+  --default MODEL              Lead/default model (default: claude-gpt-5-6-sol)
+  --opus MODEL                 Opus slot (default: claude-gpt-5-6-terra)
+  --sonnet MODEL               Sonnet slot (default: claude-gpt-5-6-sol)
+  --haiku MODEL                Haiku slot (default: claude-gpt-5-4-mini)
+  --subagent MODEL             Subagent model (default: claude-gpt-5-6-sol)
+  --concurrency N              Tool/subagent concurrency (default: 3)
+  --effort LEVEL               Default effort: low|medium|high|xhigh|max
+  --no-activate                Write profile without making it global
+
+ENVIRONMENT
+  CVC_GATEWAY_KEY              Preferred non-interactive token input
+  ANTHROPIC_AUTH_TOKEN         Fallback token input
+  CVC_BASE_URL                 Default gateway URL override
+  CVM_DIR                      CVM directory (default: ~/.cvm)
+
+The generated profile enables gateway discovery and effort for custom IDs,
+limits tool/subagent concurrency, pins subagents, and disables deferred tool
+search because cvc does not currently translate tool_reference blocks.
+EOF
+}
+
+_cvc_quote() {
+  local value="$1"
+  printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+_cvc_require_cvp() {
+  [[ -x "${CVM_DIR:-$HOME/.cvm}/bin/cvm" ]] || command -v cvm >/dev/null 2>&1 || _cvc_die "cvm is required"
+  [[ -f "${CVM_DIR:-$HOME/.cvm}/plugins/cvp/plugin.sh" ]] || _cvc_die "cvp is required; run: cvm plugin install alexandernicholson/cvp"
+}
+
+_cvc_profile_path() {
+  printf '%s/profiles/%s.env' "${CVM_DIR:-$HOME/.cvm}" "$1"
+}
+
+_cvc_cvm() {
+  local binary="${CVM_DIR:-$HOME/.cvm}/bin/cvm"
+  if [[ -x "$binary" ]]; then "$binary" "$@"; else cvm "$@"; fi
+}
+
+_cvc_configure() {
+  local profile="codex" url="${CVC_BASE_URL:-http://127.0.0.1:18082}"
+  local token="${CVC_GATEWAY_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}"
+  local default_model="claude-gpt-5-6-sol" opus="claude-gpt-5-6-terra"
+  local sonnet="claude-gpt-5-6-sol" haiku="claude-gpt-5-4-mini"
+  local subagent="claude-gpt-5-6-sol" concurrency="3" effort="high" activate=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile|--url|--token|--default|--opus|--sonnet|--haiku|--subagent|--concurrency|--effort)
+        local option="$1"
+        [[ $# -ge 2 ]] || { _cvc_die "$option requires a value"; return 1; }
+        case "$option" in
+          --profile) profile="$2" ;;
+          --url) url="$2" ;;
+          --token) token="$2" ;;
+          --default) default_model="$2" ;;
+          --opus) opus="$2" ;;
+          --sonnet) sonnet="$2" ;;
+          --haiku) haiku="$2" ;;
+          --subagent) subagent="$2" ;;
+          --concurrency) concurrency="$2" ;;
+          --effort) effort="$2" ;;
+        esac
+        shift 2
+        ;;
+      --no-activate) activate=0; shift ;;
+      -h|--help) _cvc_help; return 0 ;;
+      *) _cvc_die "unknown option: $1"; return 1 ;;
+    esac
+  done
+  [[ "$profile" =~ ^[A-Za-z0-9._-]+$ ]] || { _cvc_die "invalid profile name"; return 1; }
+  [[ "$url" == http://* || "$url" == https://* ]] || { _cvc_die "gateway URL must begin with http:// or https://"; return 1; }
+  [[ -n "$token" ]] || {
+    if [[ -t 0 ]]; then
+      printf 'Gateway bearer token: ' >&2
+      IFS= read -r -s token
+      printf '\n' >&2
+    fi
+  }
+  [[ -n "$token" ]] || { _cvc_die "set CVC_GATEWAY_KEY or pass --token"; return 1; }
+  [[ "$concurrency" =~ ^[1-9][0-9]*$ ]] || { _cvc_die "concurrency must be a positive integer"; return 1; }
+  case "$effort" in low|medium|high|xhigh|max) ;; *) _cvc_die "effort must be low, medium, high, xhigh, or max"; return 1 ;; esac
+  for model in "$default_model" "$opus" "$sonnet" "$haiku" "$subagent"; do
+    [[ "$model" == claude-* || "$model" == anthropic-* ]] || { _cvc_die "model IDs must begin with claude- or anthropic-: $model"; return 1; }
+  done
+  _cvc_require_cvp || return 1
+
+  local cvm_dir="${CVM_DIR:-$HOME/.cvm}" path tmp
+  path="$(_cvc_profile_path "$profile")"
+  mkdir -p "$cvm_dir/profiles"
+  umask 077
+  tmp="${path}.tmp.$$"
+  trap 'rm -f "$tmp"' RETURN
+  {
+    printf '# Profile: %s\n' "$profile"
+    printf '# Generated by cvm cvc configure.\n'
+    printf 'ANTHROPIC_BASE_URL=%s\n' "$(_cvc_quote "$url")"
+    printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "$(_cvc_quote "$token")"
+    printf 'ANTHROPIC_MODEL=%s\n' "$(_cvc_quote "$default_model")"
+    printf 'ANTHROPIC_DEFAULT_OPUS_MODEL=%s\n' "$(_cvc_quote "$opus")"
+    printf 'ANTHROPIC_DEFAULT_SONNET_MODEL=%s\n' "$(_cvc_quote "$sonnet")"
+    printf 'ANTHROPIC_DEFAULT_HAIKU_MODEL=%s\n' "$(_cvc_quote "$haiku")"
+    printf 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\n'
+    printf 'CLAUDE_CODE_SUBAGENT_MODEL=%s\n' "$(_cvc_quote "$subagent")"
+    printf 'CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1\n'
+    printf 'CLAUDE_CODE_EFFORT_LEVEL=%s\n' "$(_cvc_quote "$effort")"
+    printf 'CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=%s\n' "$(_cvc_quote "$concurrency")"
+    printf 'ENABLE_TOOL_SEARCH=false\n'
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$path"
+  trap - RETURN
+  _cvc_ok "Wrote secure profile '$profile' to $path"
+  if [[ $activate -eq 1 ]]; then
+    _cvc_cvm profile use "$profile" || return 1
+  else
+    _cvc_info "Activate later with: cvm profile use $profile"
+  fi
+}
+
+_cvc_load_profile() {
+  local path
+  path="$(_cvc_profile_path "$1")"
+  [[ -f "$path" ]] || { _cvc_die "profile '$1' does not exist"; return 1; }
+  set -a
+  # Profiles generated by this plugin contain only quoted KEY=VALUE assignments.
+  # shellcheck disable=SC1090
+  source "$path"
+  set +a
+}
+
+_cvc_status() {
+  local profile="${1:-codex}"
+  _cvc_load_profile "$profile" || return 1
+  command -v curl >/dev/null 2>&1 || { _cvc_die "curl is required"; return 1; }
+  _cvc_info "Checking $ANTHROPIC_BASE_URL"
+  curl --fail --silent --show-error "$ANTHROPIC_BASE_URL/healthz"
+  printf '\n'
+  curl --fail --silent --show-error "$ANTHROPIC_BASE_URL/readyz"
+  printf '\n'
+  curl --fail --silent --show-error --header "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_BASE_URL/v1/models?limit=1000"
+  printf '\n'
+  _cvc_ok "Gateway is healthy, ready, and authenticated"
+}
+
+_cvc_test() {
+  local profile="${1:-codex}"
+  _cvc_load_profile "$profile" || return 1
+  command -v claude >/dev/null 2>&1 || { _cvc_die "claude is required"; return 1; }
+  _cvc_info "Running Claude Code through profile '$profile'"
+  CVM_PROFILE="$profile" claude -p --model "$ANTHROPIC_MODEL" --effort "${CLAUDE_CODE_EFFORT_LEVEL:-high}" --output-format json "Reply with exactly: CVC_PLUGIN_OK"
+}
+
+cvc_plugin_main() {
+  local command="${1:-help}"
+  [[ $# -eq 0 ]] || shift
+  case "$command" in
+    configure|setup) _cvc_configure "$@" ;;
+    show) _cvc_cvm profile show "${1:-codex}" ;;
+    status) _cvc_status "${1:-codex}" ;;
+    test) _cvc_test "${1:-codex}" ;;
+    help|-h|--help) _cvc_help ;;
+    *) _cvc_die "unknown command: $command"; _cvc_help >&2; return 1 ;;
+  esac
+}
