@@ -45,7 +45,7 @@ plugin. It requires the
 
 ```sh
 cvm plugin install alexandernicholson/cvp
-cvm plugin install alexandernicholson/cvc
+cvm plugin install DragonStuff/cvc
 ```
 
 To install directly from a source checkout instead:
