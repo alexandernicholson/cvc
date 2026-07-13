@@ -8,8 +8,7 @@ services:
       CVC_PUBLIC_URL: https://${CVC_HOST}
       CVC_DATABASE_URL: sqlite:///data/cvc.db?mode=rwc
       CVC_MASTER_KEY: ${CVC_MASTER_KEY:?required}
-      CVC_MODELS: ${CVC_MODELS:?required}
-      CVC_DEFAULT_MODEL: claude-codex-default
+      CVC_MODELS: ${CVC_MODELS:-[]}
     volumes: [cvc-data:/data]
     healthcheck:
       test: [CMD, cvc, --version]

@@ -5,10 +5,10 @@ use cvc::{
     crypto::{Vault, hash_key, issue_gateway_key},
     db::{Repository, SqliteRepository},
     oauth::OAuthClient,
-    openai::CodexClient,
+    openai::{CodexClient, CodexOptions},
     server::{self, AppState},
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -78,8 +78,14 @@ async fn serve(cfg: Arc<Config>, repo: Arc<dyn Repository>) -> anyhow::Result<()
         repo.clone(),
         vault.clone(),
         oauth.clone(),
-        cfg.upstream_url.clone(),
-        cfg.per_user_concurrency,
+        CodexOptions {
+            responses_url: cfg.upstream_url.clone(),
+            models_url: cfg.upstream_models_url.clone(),
+            client_version: cfg.codex_client_version.clone(),
+            model_ttl: Duration::from_secs(cfg.model_cache_ttl_seconds),
+            seed_models: cfg.models.clone(),
+            concurrency: cfg.per_user_concurrency,
+        },
     );
     let app = server::router(AppState {
         config: cfg.clone(),

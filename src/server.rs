@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     crypto::Vault,
     db::{OAuthAttempt, Repository},
-    error::ApiError,
+    error::{ApiError, from_upstream_event},
     oauth::{OAuthClient, now},
     openai::CodexClient,
     protocol::MessageRequest,
@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -38,6 +38,8 @@ static INFERENCE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INFERENCE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LATENCY_BUCKETS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 const LATENCY_BOUNDS_MS: [u64; 5] = [100, 500, 1_000, 5_000, u64::MAX];
+static INPUT_TOKENIZER: LazyLock<tiktoken_rs::CoreBPE> =
+    LazyLock::new(|| tiktoken_rs::o200k_base().expect("embedded o200k tokenizer must be valid"));
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -56,6 +58,7 @@ pub fn router(s: AppState) -> Router {
         .route("/auth/openai", delete(disconnect))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn(authenticate));
     Router::new()
         .route("/", head(|| async { StatusCode::OK }))
@@ -114,12 +117,35 @@ async fn metrics() -> impl IntoResponse {
         body,
     )
 }
-async fn models(State(s): State<AppState>) -> Json<Value> {
-    let mut ms = s.config.models.values().collect::<Vec<_>>();
-    ms.sort_by_key(|m| &m.alias);
+async fn models(State(s): State<AppState>, Caller(user): Caller) -> Json<Value> {
+    let catalog = s.codex.models(&user.id, false).await;
+    let mut models = catalog.values().collect::<Vec<_>>();
+    models.sort_by_key(|model| &model.alias);
     Json(
-        json!({"data":ms.into_iter().map(|m|json!({"id":m.alias,"type":"model","display_name":m.display_name,"created_at":"2026-01-01T00:00:00Z"})).collect::<Vec<_>>(),"has_more":false,"first_id":null,"last_id":null}),
+        json!({"data":models.into_iter().map(|model|json!({"id":model.alias,"type":"model","display_name":model.display_name,"created_at":"2026-01-01T00:00:00Z","context_window":model.context_limit,"max_output_tokens":model.output_limit})).collect::<Vec<_>>(),"has_more":false,"first_id":null,"last_id":null}),
     )
+}
+async fn count_tokens(
+    State(s): State<AppState>,
+    Caller(user): Caller,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| ApiError::validation("token count request must be a JSON object"))?;
+    object.entry("max_tokens").or_insert_with(|| json!(1));
+    object.insert("stream".into(), json!(false));
+    let request: MessageRequest = serde_json::from_value(body)
+        .map_err(|_| ApiError::validation("invalid message token count request"))?;
+    let catalog = s.codex.models(&user.id, false).await;
+    let model = catalog
+        .get(&request.model)
+        .ok_or_else(|| ApiError::validation(format!("unknown model '{}'", request.model)))?;
+    let translated = translate::request(&request, model)?;
+    let encoded = serde_json::to_string(&translated)
+        .map_err(|_| ApiError::server("token count serialization failed"))?;
+    let input_tokens = INPUT_TOKENIZER.encode_with_special_tokens(&encoded).len();
+    Ok(Json(json!({"input_tokens": input_tokens})))
 }
 async fn disconnect(State(s): State<AppState>, Caller(u): Caller) -> Result<StatusCode, ApiError> {
     s.repo
@@ -251,9 +277,8 @@ async fn messages(
 ) -> Result<Response, ApiError> {
     INFERENCE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    let model = s
-        .config
-        .models
+    let catalog = s.codex.models(&u.id, false).await;
+    let model = catalog
         .get(&r.model)
         .ok_or_else(|| ApiError::validation(format!("unknown model '{}'", r.model)))?;
     let body = translate::request(&r, model)?;
@@ -267,7 +292,7 @@ async fn messages(
     };
     record_latency(started.elapsed());
     if r.stream {
-        let stream = anthropic_stream(upstream.bytes_stream());
+        let stream = anthropic_stream(upstream.bytes_stream(), model.upstream.clone());
         let mut response = Sse::new(stream)
             .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response();
@@ -276,7 +301,7 @@ async fn messages(
             .insert("x-accel-buffering", HeaderValue::from_static("no"));
         Ok(response)
     } else {
-        match nonstream(upstream.bytes_stream(), &r.model).await {
+        match nonstream(upstream.bytes_stream(), &model.upstream).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 INFERENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -295,6 +320,7 @@ fn record_latency(elapsed: Duration) {
 }
 fn anthropic_stream<S>(
     input: S,
+    model: String,
 ) -> impl Stream<Item = Result<axum::response::sse::Event, Infallible>>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -313,8 +339,36 @@ where
                         let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else { continue };
                         if data == "[DONE]" { continue }
                         if let Ok(value) = serde_json::from_str::<Value>(data) {
+                            let event_type = value
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let upstream_failed = matches!(event_type, "response.failed" | "error");
+                            if upstream_failed {
+                                let upstream_error_code = value
+                                    .pointer("/response/error/code")
+                                    .or_else(|| value.pointer("/error/code"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                let upstream_error_type = value
+                                    .pointer("/response/error/type")
+                                    .or_else(|| value.pointer("/error/type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                INFERENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    model,
+                                    upstream_event = event_type,
+                                    upstream_error_code,
+                                    upstream_error_type,
+                                    "Codex upstream reported an in-stream failure"
+                                );
+                            }
                             match machine.apply(&value) {
-                                Ok(events) => for event in events { yield Ok(event) },
+                                Ok(events) => {
+                                    for event in events { yield Ok(event) }
+                                    if upstream_failed { return }
+                                },
                                 Err(error) => { yield Ok(axum::response::sse::Event::default().event("error").json_data(json!({"type":"error","error":{"type":error.kind,"message":error.message}})).unwrap()); return; }
                             }
                         }
@@ -457,11 +511,7 @@ where
                     upstream_error_type,
                     "Codex upstream reported an in-stream failure"
                 );
-                return Err(ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    "Codex upstream stream failed",
-                ));
+                return Err(from_upstream_event(&event));
             }
             _ => {}
         }

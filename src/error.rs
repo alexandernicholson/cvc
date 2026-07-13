@@ -3,7 +3,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 #[derive(Debug)]
 pub struct ApiError {
@@ -29,6 +29,48 @@ impl ApiError {
             message: m.into(),
             retry_after: None,
         }
+    }
+}
+
+pub fn from_upstream_event(event: &Value) -> ApiError {
+    let code = event
+        .pointer("/response/error/code")
+        .or_else(|| event.pointer("/error/code"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let kind = event
+        .pointer("/response/error/type")
+        .or_else(|| event.pointer("/error/type"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match (code, kind) {
+        ("context_length_exceeded", _) => ApiError::validation(
+            "request exceeds the upstream model context window; shorten or compact the conversation",
+        ),
+        ("rate_limit_exceeded", _) | (_, "rate_limit_error") => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "Codex upstream rate limit exceeded",
+        ),
+        (_, "invalid_request_error") => ApiError::validation("Codex upstream rejected the request"),
+        (_, "authentication_error") => {
+            ApiError::auth("Codex upstream rejected the OpenAI credential")
+        }
+        (_, "permission_error") => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Codex upstream denied access to the requested model",
+        ),
+        (_, "overloaded_error") => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "Codex upstream is overloaded",
+        ),
+        _ => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "Codex upstream stream failed",
+        ),
     }
 }
 impl IntoResponse for ApiError {

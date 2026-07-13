@@ -26,8 +26,10 @@ pub struct Config {
     pub trusted_proxy: bool,
     pub master_key: [u8; 32],
     pub models: HashMap<String, Model>,
-    pub default_model: String,
     pub upstream_url: String,
+    pub upstream_models_url: String,
+    pub codex_client_version: String,
+    pub model_cache_ttl_seconds: u64,
     pub oauth_issuer: String,
     pub oauth_client_id: String,
     pub max_body_bytes: usize,
@@ -54,7 +56,7 @@ impl Config {
         let master_key: [u8; 32] = decoded
             .try_into()
             .map_err(|_| anyhow::anyhow!("CVC_MASTER_KEY must decode to 32 bytes"))?;
-        let model_json = std::env::var("CVC_MODELS").context("CVC_MODELS is required")?;
+        let model_json = std::env::var("CVC_MODELS").unwrap_or_else(|_| "[]".into());
         let entries: Vec<Model> =
             serde_json::from_str(&model_json).context("invalid CVC_MODELS JSON")?;
         let mut models = HashMap::new();
@@ -71,11 +73,15 @@ impl Config {
             }
             models.insert(model.alias.clone(), model);
         }
-        let default_model =
-            std::env::var("CVC_DEFAULT_MODEL").unwrap_or_else(|_| "claude-codex-default".into());
-        if !models.contains_key(&default_model) {
-            bail!("CVC_DEFAULT_MODEL is not present in CVC_MODELS");
-        }
+        let upstream_url = std::env::var("CVC_UPSTREAM_URL")
+            .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into());
+        let upstream_models_url = std::env::var("CVC_UPSTREAM_MODELS_URL").unwrap_or_else(|_| {
+            let base = upstream_url
+                .rsplit_once('/')
+                .map(|(base, _)| base)
+                .unwrap_or(upstream_url.as_str());
+            format!("{base}/models")
+        });
         Ok(Self {
             bind,
             database_url,
@@ -83,9 +89,11 @@ impl Config {
             trusted_proxy,
             master_key,
             models,
-            default_model,
-            upstream_url: std::env::var("CVC_UPSTREAM_URL")
-                .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".into()),
+            upstream_url,
+            upstream_models_url,
+            codex_client_version: std::env::var("CVC_CODEX_CLIENT_VERSION")
+                .unwrap_or_else(|_| "0.144.1".into()),
+            model_cache_ttl_seconds: env_num("CVC_MODEL_CACHE_TTL_SECONDS", 300),
             oauth_issuer: std::env::var("CVC_OAUTH_ISSUER")
                 .unwrap_or_else(|_| "https://auth.openai.com".into()),
             oauth_client_id: std::env::var("CVC_OAUTH_CLIENT_ID")

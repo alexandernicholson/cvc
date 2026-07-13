@@ -4,14 +4,34 @@
 
 ## Configure
 
-Required server variables:
+Required server configuration:
 
 ```sh
 export CVC_MASTER_KEY="$(openssl rand -base64 32)"
-export CVC_MODELS='[{"alias":"claude-gpt-5-6-sol","display_name":"GPT-5.6-Sol","upstream":"gpt-5.6-sol","efforts":["low","medium","high","xhigh","max"],"context_limit":372000,"output_limit":32000,"structured_output":true}]'
-export CVC_DEFAULT_MODEL=claude-gpt-5-6-sol
 export CVC_DATABASE_URL='sqlite://cvc.db?mode=rwc'
 cargo run -- serve
+```
+
+The authenticated Codex `/models` endpoint is authoritative. Catalogs are
+cached in memory per gateway user for five minutes and refreshed lazily.
+Expired-cache refresh failures serve the stale catalog and leave it expired so
+the next request retries immediately. An inference `404` forces an immediate
+catalog refresh and temporarily suppresses the rejected model until the next
+cache interval; this handles model-list propagation delays without permanently
+removing a temporarily unavailable model.
+
+New upstream slugs receive deterministic Claude-compatible IDs: dots and other
+non-alphanumeric characters become hyphens and `claude-` is prepended.
+`CVC_MODELS` is an optional JSON array for stable custom aliases, output limits,
+structured-output flags, and cold-start fallback entries. Availability still
+comes from upstream whenever discovery succeeds.
+
+Optional discovery controls:
+
+```sh
+export CVC_MODEL_CACHE_TTL_SECONDS=300
+export CVC_UPSTREAM_MODELS_URL=https://chatgpt.com/backend-api/codex/models
+export CVC_CODEX_CLIENT_VERSION=0.144.1
 ```
 
 A non-private `CVC_BIND` is rejected unless both `CVC_TRUSTED_PROXY=true` and `CVC_PUBLIC_URL=https://…` are set. The Compose example supplies Caddy TLS and immediate SSE flushing. V1 supports exactly one `cvc` replica.
@@ -30,12 +50,14 @@ cvc login --server https://cvc.example.com --token cvc_…
 ## Claude Code configuration
 
 Claude Code accepts gateway-discovered model IDs only when they begin with
-`claude-` or `anthropic-`. Use a Claude-compatible alias while keeping the real
-Codex name as its display name and upstream target:
+`claude-` or `anthropic-`. CVC automatically converts discovered Codex slugs:
 
 ```text
-claude-gpt-5-6-sol → GPT-5.6-Sol → gpt-5.6-sol
+gpt-5.6-sol → claude-gpt-5-6-sol (display name: GPT-5.6-Sol)
 ```
+
+An optional `CVC_MODELS` entry with the same `upstream` value preserves its
+configured alias instead.
 
 ### CVM plugin
 
@@ -143,11 +165,21 @@ export ENABLE_TOOL_SEARCH=false
 claude
 ```
 
-`/v1/messages/count_tokens` intentionally returns 404 so Claude Code uses its
-local estimate. The service does not store conversations. Prometheus metrics
-contain counts and latency only. Application logs never contain authorization,
-OAuth codes, prompts, tool results, tokens, or response bodies. Real Codex
-subscription tests remain opt-in and are never run in ordinary CI.
+`/v1/messages/count_tokens` accepts the Anthropic request without requiring
+`max_tokens`, translates it through the same request path used for inference,
+and counts the normalized payload with the GPT-family `o200k` tokenizer. Model
+discovery also publishes the upstream `context_window` and the configured
+`max_output_tokens`, allowing clients to compact before the upstream rejects
+the request.
+
+The service does not store conversations. Prometheus metrics contain counts and
+latency only. Application logs never contain authorization, OAuth codes,
+prompts, tool results, tokens, or response bodies. Real Codex subscription
+tests remain opt-in and are never run in ordinary CI.
+
+An upstream `context_length_exceeded` stream event is returned as Anthropic
+`invalid_request_error`, with an instruction to shorten or compact the
+conversation. It is not reported as a retryable gateway `502`.
 
 ## Attribution
 
