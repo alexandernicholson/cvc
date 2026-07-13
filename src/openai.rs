@@ -93,54 +93,124 @@ impl CodexClient {
         Ok(t)
     }
     pub async fn responses(&self, id: &str, body: Value) -> Result<Upstream, ApiError> {
+        const MAX_TRANSIENT_RETRIES: usize = 2;
         let permit = self.permit(id).await?;
-        for force in [false, true] {
-            let t = self.tokens(id, force).await?;
-            let r = self
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let mut transient_retries = 0;
+        let mut request_attempt = 0;
+        let mut force_refresh = false;
+        let mut refreshed = false;
+
+        loop {
+            request_attempt += 1;
+            let tokens = self.tokens(id, force_refresh).await?;
+            force_refresh = false;
+            let response = self
                 .http
                 .post(&self.url)
-                .bearer_auth(&t.access_token)
-                .header("chatgpt-account-id", &t.account_id)
+                .bearer_auth(&tokens.access_token)
+                .header("chatgpt-account-id", &tokens.account_id)
                 .header("originator", "cvc")
                 .header("openai-beta", "responses=experimental")
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .send()
-                .await
-                .map_err(|_| {
-                    ApiError::new(
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(_) if transient_retries < MAX_TRANSIENT_RETRIES => {
+                    transient_retries += 1;
+                    tracing::warn!(
+                        model,
+                        attempt = request_attempt,
+                        retry = transient_retries,
+                        "Codex upstream connection failed before streaming; retrying"
+                    );
+                    transient_backoff(transient_retries).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        model,
+                        attempt = request_attempt,
+                        "Codex upstream connection failed before streaming"
+                    );
+                    return Err(ApiError::new(
                         http::StatusCode::BAD_GATEWAY,
                         "api_error",
                         "upstream connection failed",
-                    )
-                })?;
-            if r.status() == http::StatusCode::UNAUTHORIZED && !force {
+                    ));
+                }
+            };
+
+            let status = response.status();
+            if status == http::StatusCode::UNAUTHORIZED && !refreshed {
+                refreshed = true;
+                force_refresh = true;
+                tracing::warn!(
+                    model,
+                    attempt = request_attempt,
+                    upstream_status = status.as_u16(),
+                    "Codex upstream rejected credential; refreshing once"
+                );
                 continue;
             }
-            if !r.status().is_success() {
-                let status = r.status();
-                let retry = r
+
+            let transient = matches!(status.as_u16(), 502..=504);
+            if transient && transient_retries < MAX_TRANSIENT_RETRIES {
+                transient_retries += 1;
+                tracing::warn!(
+                    model,
+                    attempt = request_attempt,
+                    retry = transient_retries,
+                    upstream_status = status.as_u16(),
+                    "Codex upstream failed before streaming; retrying"
+                );
+                transient_backoff(transient_retries).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let retry_after = response
                     .headers()
                     .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
+                    .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
+                tracing::warn!(
+                    model,
+                    attempt = request_attempt,
+                    upstream_status = status.as_u16(),
+                    "Codex upstream request failed before streaming"
+                );
                 let (out, kind) = match status.as_u16() {
+                    401 => (http::StatusCode::UNAUTHORIZED, "authentication_error"),
                     400..=422 => (http::StatusCode::BAD_REQUEST, "invalid_request_error"),
                     429 => (http::StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
                     503 => (http::StatusCode::SERVICE_UNAVAILABLE, "overloaded_error"),
                     _ => (http::StatusCode::BAD_GATEWAY, "api_error"),
                 };
-                let mut e = ApiError::new(out, kind, format!("Codex upstream returned {status}"));
-                e.retry_after = retry;
-                return Err(e);
+                let mut error =
+                    ApiError::new(out, kind, format!("Codex upstream returned {status}"));
+                error.retry_after = retry_after;
+                return Err(error);
             }
+
             return Ok(Upstream {
-                response: r,
+                response,
                 _permit: permit,
             });
         }
-        Err(ApiError::auth("OpenAI authentication failed"))
     }
+}
+async fn transient_backoff(retry: usize) {
+    let base_ms = 150_u64.saturating_mul(1_u64 << retry.saturating_sub(1));
+    let jitter_ms = rand::random::<u64>() % 101;
+    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
 }
 pub struct Upstream {
     response: reqwest::Response,

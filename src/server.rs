@@ -276,7 +276,13 @@ async fn messages(
             .insert("x-accel-buffering", HeaderValue::from_static("no"));
         Ok(response)
     } else {
-        nonstream(upstream.bytes_stream(), &r.model).await
+        match nonstream(upstream.bytes_stream(), &r.model).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                INFERENCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
     }
 }
 fn record_latency(elapsed: Duration) {
@@ -433,7 +439,24 @@ where
             Some("response.completed") => {
                 usage = json!({"input_tokens":event.pointer("/response/usage/input_tokens").and_then(Value::as_u64).unwrap_or(0),"output_tokens":event.pointer("/response/usage/output_tokens").and_then(Value::as_u64).unwrap_or(0)});
             }
-            Some("response.failed") | Some("error") => {
+            Some(event_type @ ("response.failed" | "error")) => {
+                let upstream_error_code = event
+                    .pointer("/response/error/code")
+                    .or_else(|| event.pointer("/error/code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let upstream_error_type = event
+                    .pointer("/response/error/type")
+                    .or_else(|| event.pointer("/error/type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                tracing::warn!(
+                    model,
+                    upstream_event = event_type,
+                    upstream_error_code,
+                    upstream_error_type,
+                    "Codex upstream reported an in-stream failure"
+                );
                 return Err(ApiError::new(
                     StatusCode::BAD_GATEWAY,
                     "api_error",

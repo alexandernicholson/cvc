@@ -25,14 +25,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 static UPSTREAM_CALLS: AtomicU64 = AtomicU64::new(0);
+static RETRY_UPSTREAM_CALLS: AtomicU64 = AtomicU64::new(0);
 
-async fn codex_mock(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
-    assert_eq!(headers.get("chatgpt-account-id").unwrap(), "account-test");
-    assert_eq!(headers.get("originator").unwrap(), "cvc");
-    assert_eq!(body["model"], "gpt-test");
-    assert_eq!(body["store"], false);
-    assert_eq!(body["reasoning"]["effort"], "high");
-    UPSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
+fn successful_frames() -> String {
     let completed = json!({
         "type":"response.completed",
         "response":{
@@ -43,7 +38,7 @@ async fn codex_mock(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> 
             "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
         }
     });
-    let frames = [
+    [
         json!({"type":"response.created","response":{"id":"resp_test","model":"gpt-test"}}),
         json!({"type":"response.output_item.added","item":{"type":"message","id":"item_1"}}),
         json!({"type":"response.output_text.delta","item_id":"item_1","delta":"hel"}),
@@ -53,17 +48,47 @@ async fn codex_mock(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> 
     ]
     .into_iter()
     .map(|value| format!("data: {value}\n\n"))
-    .collect::<String>();
-    ([(header::CONTENT_TYPE, "text/event-stream")], frames)
+    .collect()
 }
 
-async fn fixture() -> (Router, tempfile::TempDir, String) {
+async fn codex_mock(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    assert_eq!(headers.get("chatgpt-account-id").unwrap(), "account-test");
+    assert_eq!(headers.get("originator").unwrap(), "cvc");
+    assert_eq!(body["model"], "gpt-test");
+    assert_eq!(body["store"], false);
+    assert_eq!(body["reasoning"]["effort"], "high");
+    UPSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
+    (
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        successful_frames(),
+    )
+}
+async fn retry_mock(
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    assert_eq!(headers.get("chatgpt-account-id").unwrap(), "account-test");
+    assert_eq!(body["model"], "gpt-test");
+    let attempt = RETRY_UPSTREAM_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    if attempt <= 2 {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        successful_frames(),
+    )
+        .into_response()
+}
+
+async fn fixture_with_path(path: &str) -> (Router, tempfile::TempDir, String) {
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(
             upstream_listener,
-            Router::new().route("/responses", post(codex_mock)),
+            Router::new()
+                .route("/responses", post(codex_mock))
+                .route("/retry", post(retry_mock)),
         )
         .await
         .unwrap();
@@ -110,7 +135,7 @@ async fn fixture() -> (Router, tempfile::TempDir, String) {
         master_key: [42; 32],
         models: HashMap::from([(model.alias.clone(), model)]),
         default_model: "claude-codex-default".into(),
-        upstream_url: format!("http://{upstream_addr}/responses"),
+        upstream_url: format!("http://{upstream_addr}{path}"),
         oauth_issuer: "http://127.0.0.1:1".into(),
         oauth_client_id: "test".into(),
         max_body_bytes: 1024 * 1024,
@@ -136,6 +161,9 @@ async fn fixture() -> (Router, tempfile::TempDir, String) {
         directory,
         gateway_key,
     )
+}
+async fn fixture() -> (Router, tempfile::TempDir, String) {
+    fixture_with_path("/responses").await
 }
 
 fn message(stream: bool, key: &str) -> Request<Body> {
@@ -217,5 +245,23 @@ async fn live_endpoints_and_mock_inference_work_end_to_end() {
             .to_vec(),
     )
     .unwrap();
-    assert!(metrics.contains("cvc_inference_requests_total 2"));
+    let request_count = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("cvc_inference_requests_total "))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap();
+    assert!(request_count >= 2);
+}
+
+#[tokio::test]
+async fn retries_transient_upstream_failures_before_streaming() {
+    RETRY_UPSTREAM_CALLS.store(0, Ordering::SeqCst);
+    let (app, _directory, key) = fixture_with_path("/retry").await;
+
+    let response = app.oneshot(message(false, &key)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(value["content"][0]["text"], "hello");
+    assert_eq!(RETRY_UPSTREAM_CALLS.load(Ordering::SeqCst), 3);
 }
