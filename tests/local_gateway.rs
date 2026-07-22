@@ -35,7 +35,11 @@ fn successful_frames() -> String {
             "id":"resp_test",
             "model":"gpt-test",
             "status":"completed",
-            "usage":{"input_tokens":7,"output_tokens":2},
+            "usage":{
+                "input_tokens":17,
+                "output_tokens":2,
+                "input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3}
+            },
             "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
         }
     });
@@ -58,6 +62,7 @@ async fn codex_mock(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> 
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["store"], false);
     assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["prompt_cache_key"].as_str().map(str::len), Some(64));
     UPSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
     (
         [(header::CONTENT_TYPE, "text/event-stream")],
@@ -219,6 +224,7 @@ fn message(stream: bool, key: &str) -> Request<Body> {
     Request::builder().method("POST").uri("/v1/messages?beta=true")
         .header(header::AUTHORIZATION, format!("Bearer {key}"))
         .header(header::CONTENT_TYPE, "application/json")
+        .header("x-claude-code-session-id", "session-test")
         .body(Body::from(json!({"model":"claude-codex-default","max_tokens":32,"stream":stream,"messages":[{"role":"user","content":"say hello"}],"output_config":{"effort":"high"},"future_beta_field":{"enabled":true}}).to_string())).unwrap()
 }
 
@@ -273,7 +279,10 @@ async fn live_endpoints_and_mock_inference_work_end_to_end() {
         serde_json::from_slice(&to_bytes(nonstream.into_body(), usize::MAX).await.unwrap())
             .unwrap();
     assert_eq!(value["content"][0]["text"], "hello");
-    assert_eq!(value["usage"], json!({"input_tokens":7,"output_tokens":2}));
+    assert_eq!(
+        value["usage"],
+        json!({"input_tokens":7,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":7})
+    );
     assert_eq!(value["stop_reason"], "end_turn");
 
     let streaming = app.clone().oneshot(message(true, &key)).await.unwrap();
@@ -297,6 +306,8 @@ async fn live_endpoints_and_mock_inference_work_end_to_end() {
         assert!(events.contains(expected), "missing {expected} in {events}");
     }
     assert!(events.contains("hel"));
+    assert!(events.contains("\"cache_creation_input_tokens\":3"));
+    assert!(events.contains("\"cache_read_input_tokens\":7"));
     assert!(events.contains("lo"));
     assert_eq!(UPSTREAM_CALLS.load(Ordering::SeqCst), 2);
 

@@ -6,20 +6,21 @@ use crate::{
     error::{ApiError, from_upstream_event},
     oauth::{OAuthClient, now},
     openai::CodexClient,
-    protocol::MessageRequest,
+    protocol::{MessageRequest, Usage},
     stream::Machine,
     translate,
 };
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response, Sse},
     routing::{delete, get, head, post},
 };
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -270,9 +271,34 @@ async fn device_cancel(
         .map_err(|_| ApiError::server("device authorization unavailable"))?;
     Ok(StatusCode::NO_CONTENT)
 }
+fn prompt_cache_key(headers: &HeaderMap, user_id: &str) -> Option<String> {
+    let session_id = headers
+        .get("x-claude-code-session-id")?
+        .to_str()
+        .ok()?
+        .trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let agent_id = headers
+        .get("x-claude-code-agent-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let mut hash = Sha256::new();
+    hash.update(b"cvc:prompt-cache:v1");
+    for value in [user_id, session_id, agent_id] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
 async fn messages(
     State(s): State<AppState>,
     Caller(u): Caller,
+    headers: HeaderMap,
     Json(r): Json<MessageRequest>,
 ) -> Result<Response, ApiError> {
     INFERENCE_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -281,7 +307,10 @@ async fn messages(
     let model = catalog
         .get(&r.model)
         .ok_or_else(|| ApiError::validation(format!("unknown model '{}'", r.model)))?;
-    let body = translate::request(&r, model)?;
+    let mut body = translate::request(&r, model)?;
+    if let Some(key) = prompt_cache_key(&headers, &u.id) {
+        body["prompt_cache_key"] = json!(key);
+    }
     let upstream = match s.codex.responses(&u.id, body).await {
         Ok(value) => value,
         Err(error) => {
@@ -407,7 +436,7 @@ where
     let mut thinking_signature = None;
     let mut calls: HashMap<String, (String, String)> = HashMap::new();
     let mut call_order = Vec::new();
-    let mut usage = json!({"input_tokens":0,"output_tokens":0});
+    let mut usage = Usage::default();
     let mut stop = "end_turn";
     for data in text
         .split("\n\n")
@@ -491,7 +520,7 @@ where
                 }
             }
             Some("response.completed") => {
-                usage = json!({"input_tokens":event.pointer("/response/usage/input_tokens").and_then(Value::as_u64).unwrap_or(0),"output_tokens":event.pointer("/response/usage/output_tokens").and_then(Value::as_u64).unwrap_or(0)});
+                usage = Usage::from_openai(&event["response"]["usage"]);
             }
             Some(event_type @ ("response.failed" | "error")) => {
                 let upstream_error_code = event
@@ -531,4 +560,49 @@ where
         }
     }
     Ok(Json(json!({"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"type":"message","role":"assistant","model":model,"content":content,"stop_reason":stop,"stop_sequence":null,"usage":usage})).into_response())
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+
+    fn headers(session: &'static str, agent: Option<&'static str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static(session),
+        );
+        if let Some(agent) = agent {
+            headers.insert("x-claude-code-agent-id", HeaderValue::from_static(agent));
+        }
+        headers
+    }
+
+    #[test]
+    fn prompt_cache_keys_are_stable_and_isolated() {
+        let base = prompt_cache_key(&headers("session-a", None), "user-a").unwrap();
+        assert_eq!(base.len(), 64);
+        assert_eq!(
+            base,
+            prompt_cache_key(&headers("session-a", None), "user-a").unwrap()
+        );
+        assert_ne!(
+            base,
+            prompt_cache_key(&headers("session-b", None), "user-a").unwrap()
+        );
+        assert_ne!(
+            base,
+            prompt_cache_key(&headers("session-a", None), "user-b").unwrap()
+        );
+        assert_ne!(
+            base,
+            prompt_cache_key(&headers("session-a", Some("agent-a")), "user-a").unwrap()
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_requires_a_nonempty_session() {
+        assert!(prompt_cache_key(&HeaderMap::new(), "user-a").is_none());
+        assert!(prompt_cache_key(&headers("", None), "user-a").is_none());
+    }
 }

@@ -113,8 +113,60 @@ pub struct OutputConfig {
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl Usage {
+    pub fn from_openai(value: &Value) -> Self {
+        let total = value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read_input_tokens = value
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation_input_tokens = value
+            .pointer("/input_tokens_details/cache_write_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Self {
+            input_tokens: total.saturating_sub(
+                cache_read_input_tokens.saturating_add(cache_creation_input_tokens),
+            ),
+            output_tokens: value
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn maps_openai_cache_usage_without_double_counting_input() {
+        let usage = Usage::from_openai(&json!({
+            "input_tokens": 100,
+            "output_tokens": 9,
+            "input_tokens_details": {
+                "cached_tokens": 60,
+                "cache_write_tokens": 25
+            }
+        }));
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cache_creation_input_tokens, 25);
+        assert_eq!(usage.cache_read_input_tokens, 60);
+    }
 }

@@ -1,4 +1,7 @@
-use crate::error::{ApiError, from_upstream_event};
+use crate::{
+    error::{ApiError, from_upstream_event},
+    protocol::Usage,
+};
 use axum::response::sse::Event;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -8,7 +11,7 @@ pub struct Machine {
     started: bool,
     next_index: u64,
     blocks: HashMap<String, Block>,
-    output: u64,
+    usage: Usage,
     saw_tool: bool,
 }
 struct Block {
@@ -40,7 +43,7 @@ impl Machine {
                 .pointer("/response/model")
                 .and_then(Value::as_str)
                 .unwrap_or("codex");
-            out.push(sse("message_start", json!({"type":"message_start","message":{"id":id,"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}})));
+            out.push(sse("message_start", json!({"type":"message_start","message":{"id":id,"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":Usage::default()}})));
             self.started = true;
         }
         match ty {
@@ -114,10 +117,7 @@ impl Machine {
             }
             "response.completed" => {
                 let response = &event["response"];
-                self.output = response
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                self.usage = Usage::from_openai(&response["usage"]);
                 let stop = if self.saw_tool {
                     "tool_use"
                 } else if response.get("status").and_then(Value::as_str) == Some("incomplete") {
@@ -133,7 +133,7 @@ impl Machine {
                         json!({"type":"content_block_stop","index":block.index}),
                     ));
                 }
-                out.push(sse("message_delta", json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":{"output_tokens":self.output}})));
+                out.push(sse("message_delta", json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":self.usage})));
                 out.push(sse("message_stop", json!({"type":"message_stop"})));
             }
             _ => {}
