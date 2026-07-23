@@ -322,12 +322,24 @@ async fn live_endpoints_and_mock_inference_work_end_to_end() {
             .to_vec(),
     )
     .unwrap();
-    let request_count = metrics
-        .lines()
-        .find_map(|line| line.strip_prefix("cvc_inference_requests_total "))
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap();
-    assert!(request_count >= 2);
+    let metric = |name: &str| {
+        metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap()
+    };
+    assert!(metric("cvc_inference_requests_total") >= 2);
+    assert!(metric("cvc_inference_responses_total") >= 2);
+    assert!(metric("cvc_inference_in_flight") <= metric("cvc_inference_requests_total"));
+    assert!(metric("cvc_input_tokens_total") >= 34);
+    assert!(metric("cvc_uncached_input_tokens_total") >= 14);
+    assert!(metric("cvc_output_tokens_total") >= 4);
+    assert!(metric("cvc_cache_read_input_tokens_total") >= 14);
+    assert!(metric("cvc_cache_creation_input_tokens_total") >= 6);
+    assert!(metric("cvc_cache_hit_responses_total") >= 2);
+    assert!(metrics.contains("# TYPE cvc_upstream_response_latency_seconds histogram"));
+    assert!(metrics.contains("# TYPE cvc_inference_duration_seconds histogram"));
 }
 
 #[tokio::test]
