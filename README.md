@@ -128,6 +128,7 @@ ANTHROPIC_DEFAULT_SONNET_MODEL=claude-gpt-5-6-sol
 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-gpt-5-4-mini
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 CLAUDE_CODE_SUBAGENT_MODEL=claude-gpt-5-6-sol
+CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE=80
 CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
 CLAUDE_CODE_EFFORT_LEVEL=high
 CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=3
@@ -139,6 +140,8 @@ gateway model IDs. `cvc` forwards `low`, `medium`, `high`, `xhigh`, and `max`
 unchanged as `reasoning.effort`. `CLAUDE_CODE_SUBAGENT_MODEL` pins subagents to
 the selected gateway alias. A client concurrency limit of three stays below
 the default `cvc` per-user limit of four.
+An 80% auto-compaction threshold leaves headroom for parallel subagent results
+and large tool outputs that arrive between Claude Code context checks.
 
 `ENABLE_TOOL_SEARCH=false` is currently required: Claude Code otherwise may
 send deferred `tool_reference` blocks, which `cvc` does not yet translate.
@@ -158,6 +161,7 @@ export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-gpt-5-6-sol'
 export ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-gpt-5-4-mini'
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 export CLAUDE_CODE_SUBAGENT_MODEL='claude-gpt-5-6-sol'
+export CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE=80
 export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
 export CLAUDE_CODE_EFFORT_LEVEL='high'
 export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=3

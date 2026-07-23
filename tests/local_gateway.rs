@@ -62,6 +62,7 @@ async fn codex_mock(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> 
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["store"], false);
     assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["max_output_tokens"], 32);
     assert_eq!(body["prompt_cache_key"].as_str().map(str::len), Some(64));
     UPSTREAM_CALLS.fetch_add(1, Ordering::SeqCst);
     (

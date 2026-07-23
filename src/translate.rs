@@ -53,7 +53,7 @@ pub fn request(r: &MessageRequest, m: &Model) -> Result<Value, ApiError> {
         .collect::<Vec<_>>()
         .join("\n");
     let tools=r.tools.iter().map(|t|json!({"type":"function","name":t.name,"description":t.description,"parameters":strip_annotations(t.input_schema.clone()),"strict":false})).collect::<Vec<_>>();
-    let mut out = json!({"model":m.upstream,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"auto","parallel_tool_calls":true,"stream":true,"store":false,"include":["reasoning.encrypted_content"]});
+    let mut out = json!({"model":m.upstream,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"auto","parallel_tool_calls":true,"max_output_tokens":r.max_tokens,"stream":true,"store":false,"include":["reasoning.encrypted_content"]});
     if let Some(e) = effort {
         out["reasoning"] = json!({"effort":e});
     }
@@ -122,6 +122,7 @@ mod tests {
         assert_eq!(v["model"], "gpt-test");
         assert_eq!(v["instructions"], "first\nsecond");
         assert_eq!(v["reasoning"]["effort"], "high");
+        assert_eq!(v["max_output_tokens"], 50);
         assert_eq!(v["store"], false);
     }
     #[test]

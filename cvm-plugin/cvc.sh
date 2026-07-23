@@ -124,6 +124,7 @@ _cvc_configure() {
     printf 'ANTHROPIC_DEFAULT_HAIKU_MODEL=%s\n' "$(_cvc_quote "$haiku")"
     printf 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\n'
     printf 'CLAUDE_CODE_SUBAGENT_MODEL=%s\n' "$(_cvc_quote "$subagent")"
+    printf 'CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE=80\n'
     printf 'CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1\n'
     printf 'CLAUDE_CODE_EFFORT_LEVEL=%s\n' "$(_cvc_quote "$effort")"
     printf 'CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=%s\n' "$(_cvc_quote "$concurrency")"
