@@ -31,7 +31,12 @@ pub fn request(r: &MessageRequest, m: &Model) -> Result<Value, ApiError> {
             m.efforts.join(", ")
         )));
     }
-    let format = r.output_config.as_ref().and_then(|o| o.format.clone());
+    let format = r
+        .output_config
+        .as_ref()
+        .and_then(|output| output.format.clone())
+        .map(translate_format)
+        .transpose()?;
     if format.is_some() && !m.structured_output {
         return Err(ApiError::validation(format!(
             "structured output is unsupported by {}",
@@ -70,6 +75,19 @@ pub fn request(r: &MessageRequest, m: &Model) -> Result<Value, ApiError> {
     }
     Ok(out)
 }
+fn translate_format(mut format: Value) -> Result<Value, ApiError> {
+    let object = format
+        .as_object_mut()
+        .ok_or_else(|| ApiError::validation("output format must be a JSON object"))?;
+    if object.get("type").and_then(Value::as_str) == Some("json_schema") {
+        object
+            .entry("name")
+            .or_insert_with(|| json!("claude_structured_output"));
+        object.entry("strict").or_insert_with(|| json!(false));
+    }
+    Ok(format)
+}
+
 fn tool_schema(tool: &Tool) -> Result<Value, ApiError> {
     if let Some(schema) = &tool.input_schema {
         return Ok(schema.clone());
@@ -160,6 +178,33 @@ mod tests {
         assert_eq!(v["reasoning"]["effort"], "high");
         assert_eq!(v["store"], false);
     }
+    #[test]
+    fn supplies_responses_fields_for_claude_json_schema_format() {
+        let message_request: MessageRequest = serde_json::from_value(json!({
+            "model": "claude-codex",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "title"}],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let translated = request(&message_request, &model()).unwrap();
+        assert_eq!(
+            translated["text"]["format"]["name"],
+            "claude_structured_output"
+        );
+        assert_eq!(translated["text"]["format"]["strict"], false);
+    }
+
     #[test]
     fn preserves_tools_and_results() {
         let r:MessageRequest=serde_json::from_value(json!({"model":"claude-codex","max_tokens":50,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"x"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}],"tools":[{"name":"read","description":"read","input_schema":{"type":"object","cache_control":{},"properties":{"path":{"type":"string"}}}}],"tool_choice":{"type":"tool","name":"read"}})).unwrap();
