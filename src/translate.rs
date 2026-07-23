@@ -10,9 +10,14 @@ pub fn request(r: &MessageRequest, m: &Model) -> Result<Value, ApiError> {
     if r.tools.len() > 128 {
         return Err(ApiError::validation("tool count exceeds 128"));
     }
-    if r.tools
+    let tool_schemas = r
+        .tools
         .iter()
-        .any(|t| serde_json::to_vec(&t.input_schema).map_or(true, |v| v.len() > 1024 * 1024))
+        .map(tool_schema)
+        .collect::<Result<Vec<_>, _>>()?;
+    if tool_schemas
+        .iter()
+        .any(|schema| serde_json::to_vec(schema).map_or(true, |value| value.len() > 1024 * 1024))
     {
         return Err(ApiError::validation("tool schema exceeds 1 MiB"));
     }
@@ -52,7 +57,7 @@ pub fn request(r: &MessageRequest, m: &Model) -> Result<Value, ApiError> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let tools=r.tools.iter().map(|t|json!({"type":"function","name":t.name,"description":t.description,"parameters":strip_annotations(t.input_schema.clone()),"strict":false})).collect::<Vec<_>>();
+    let tools=r.tools.iter().zip(tool_schemas).map(|(tool,schema)|json!({"type":"function","name":tool.name,"description":tool.description,"parameters":strip_annotations(schema),"strict":false})).collect::<Vec<_>>();
     let mut out = json!({"model":m.upstream,"instructions":instructions,"input":input,"tools":tools,"tool_choice":"auto","parallel_tool_calls":true,"stream":true,"store":false,"include":["reasoning.encrypted_content"]});
     if let Some(e) = effort {
         out["reasoning"] = json!({"effort":e});
@@ -65,6 +70,37 @@ pub fn request(r: &MessageRequest, m: &Model) -> Result<Value, ApiError> {
     }
     Ok(out)
 }
+fn tool_schema(tool: &Tool) -> Result<Value, ApiError> {
+    if let Some(schema) = &tool.input_schema {
+        return Ok(schema.clone());
+    }
+    match tool.name.as_str() {
+        "WebSearch" | "web_search" => Ok(json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 2},
+                "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                "blocked_domains": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })),
+        "WebFetch" | "web_fetch" => Ok(json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri"},
+                "prompt": {"type": "string"}
+            },
+            "required": ["url", "prompt"],
+            "additionalProperties": false
+        })),
+        _ => Err(ApiError::validation(format!(
+            "tool '{}' is missing input_schema",
+            tool.name
+        ))),
+    }
+}
+
 fn tool_output(v: Option<&Value>, err: bool) -> String {
     let x = v.cloned().unwrap_or(Value::String(String::new()));
     let s = match x {
@@ -132,6 +168,46 @@ mod tests {
         assert_eq!(v["input"][1]["type"], "function_call_output");
         assert!(v["tools"][0]["parameters"].get("cache_control").is_none());
     }
+    #[test]
+    fn supplies_known_web_tool_schemas_when_claude_omits_them() {
+        let request: MessageRequest = serde_json::from_value(json!({
+            "model": "claude-codex",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "WebSearch"},
+                {"type": "web_fetch_20250910", "name": "WebFetch"}
+            ]
+        }))
+        .unwrap();
+        let translated = super::request(&request, &model()).unwrap();
+        assert_eq!(
+            translated["tools"][0]["parameters"]["required"],
+            json!(["query"])
+        );
+        assert_eq!(
+            translated["tools"][1]["parameters"]["required"],
+            json!(["url", "prompt"])
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tools_without_schemas() {
+        let request: MessageRequest = serde_json::from_value(json!({
+            "model": "claude-codex",
+            "max_tokens": 50,
+            "messages": [],
+            "tools": [{"name": "unknown"}]
+        }))
+        .unwrap();
+        assert!(
+            super::request(&request, &model())
+                .unwrap_err()
+                .message
+                .contains("missing input_schema")
+        );
+    }
+
     #[test]
     fn rejects_unsupported_effort() {
         let r:MessageRequest=serde_json::from_value(json!({"model":"claude-codex","max_tokens":50,"messages":[],"output_config":{"effort":"max"}})).unwrap();

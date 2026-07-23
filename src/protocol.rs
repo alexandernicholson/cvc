@@ -102,7 +102,7 @@ pub enum ImageSource {
 pub struct Tool {
     pub name: String,
     pub description: Option<String>,
-    pub input_schema: Value,
+    pub input_schema: Option<Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
